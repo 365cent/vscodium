@@ -1,0 +1,58 @@
+--- a/src/vs/platform/update/electron-main/updateService.win32.ts	2026-03-30 03:00:43.751717480 +0000
++++ b/src/vs/platform/update/electron-main/updateService.win32.ts	2026-03-30 03:01:17.303950899 +0000
+@@ -246,11 +246,6 @@
+ 					return Promise.resolve(null);
+ 				}
+ 
+-				if (updateType === UpdateType.Archive) {
+-					this.setState(State.AvailableForDownload(update));
+-					return Promise.resolve(null);
+-				}
+-
+ 				// In the embedded app, signal that an update exists but can't be installed here.
+ 				if ((process as INodeProcess).isEmbeddedApp) {
+ 					this.logService.info('update#doCheckForUpdates - embedded app: update available, skipping download');
+@@ -341,10 +336,40 @@
+ 	}
+ 
+ 	protected override async doDownloadUpdate(state: AvailableForDownload): Promise<void> {
+-		if (state.update.url) {
+-			this.nativeHostMainService.openExternal(undefined, state.update.url);
++		if (!state.update.url) {
++			return;
++		}
++		const update = state.update;
++		const startTime = Date.now();
++		this.setState(State.Downloading(update, true, false, 0, undefined, startTime));
++		try {
++			await this.cleanup(update.version);
++			const updatePackagePath = await this.getUpdatePackagePath(update.version);
++			if (!await pfs.Promises.exists(updatePackagePath)) {
++				const downloadPath = `${updatePackagePath}.tmp`;
++				const context = await this.requestService.request({ url: update.url, callSite: NO_FETCH_TELEMETRY }, CancellationToken.None);
++				const contentLengthHeader = context.res.headers['content-length'];
++				const totalBytes = typeof contentLengthHeader === 'string' ? parseInt(contentLengthHeader, 10) : undefined;
++				let downloadedBytes = 0;
++				const progressDelayer = new Delayer<void>(500);
++				const progressStream = transform<VSBuffer, VSBuffer>(
++					context.stream,
++					{ data: data => { downloadedBytes += data.byteLength; progressDelayer.trigger(() => { this.setState(State.Downloading(update, true, false, downloadedBytes, totalBytes, startTime)); }); return data; } },
++					chunks => VSBuffer.concat(chunks)
++				);
++				await this.fileService.writeFile(URI.file(downloadPath), progressStream);
++				progressDelayer.dispose();
++				if (update.sha256hash) { await checksum(downloadPath, update.sha256hash); }
++				await pfs.Promises.rename(downloadPath, updatePackagePath, false);
++			}
++			this.availableUpdate = { packagePath: updatePackagePath };
++			this.saveUpdateMetadata(update);
++			this.setState(State.Downloaded(update, true, false));
++			this.setState(State.Ready(update, true, false));
++		} catch (err) {
++			this.logService.error('update#doDownloadUpdate', err);
++			this.setState(State.Idle(getUpdateType(), (err as Error).message));
+ 		}
+-		this.setState(State.Idle(getUpdateType()));
+ 	}
+ 
+ 	private async getUpdatePackagePath(version: string): Promise<string> {
